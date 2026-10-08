@@ -1,68 +1,56 @@
-"""
-SecureNotes API  —  Week 13 Security Lab (STUDENT VERSION)
-Web Systems and Technologies
-
-A tiny notes service: users register, log in, and keep private notes.
-It works... but it is NOT secure. Somewhere in this file are SECURITY BUGS
-that map to the OWASP Top 10 (2025). Your job is to find them and fix them.
-
-Run it:
-    uvicorn app.main:app --reload
-Open the interactive docs at:
-    http://127.0.0.1:8000/docs
-
-Do NOT change the behaviour students rely on (register, login, notes still work).
-Only make it secure. See the lab handout for the task list and rubric.
-"""
-
+"""SecureNotes API — Week 13 OWASP security fixes."""
+import base64
+import hashlib
+import hmac
+import logging
+import os
+import secrets
 import sqlite3
-import traceback
+import time
+from contextlib import suppress
+
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# --- app + config ----------------------------------------------------------
-app = FastAPI(title="SecureNotes API", version="1.0")
+app = FastAPI(title="SecureNotes API", version="1.1")
+# Set SECURENOTES_SECRET in production; random per process for local lab testing.
+SECRET_KEY = os.environ.get("SECURENOTES_SECRET") or secrets.token_hex(32)
+ALLOWED_ORIGINS = [s.strip() for s in os.environ.get("SECURENOTES_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if s.strip()]
+TOKEN_LIFETIME = 3600
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type"])
 
-# A secret used to sign things. Keep it safe.
-SECRET_KEY = "supersecret123"
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --- database (SQLite, created fresh on startup) ---------------------------
 db = sqlite3.connect(":memory:", check_same_thread=False)
 db.row_factory = sqlite3.Row
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256${salt.hex()}${key.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        method, salt_hex, key_hex = stored.split("$")
+        if method != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 310_000)
+        return hmac.compare_digest(candidate, bytes.fromhex(key_hex))
+    except (ValueError, TypeError):
+        return False
+
+
 def init_db():
-    db.executescript(
-        """
-        CREATE TABLE users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            is_admin INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        """
-    )
-    # seed: one admin, two normal users, a few notes
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin','admin123',1)")
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('alice','alicepass',0)")
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('bob','bobpass',0)")
+    db.executescript("""
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+                            password TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+                            title TEXT NOT NULL, body TEXT NOT NULL);
+    """)
+    for username, password, admin in (("admin", "admin123", 1), ("alice", "alicepass", 0), ("bob", "bobpass", 0)):
+        db.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)", (username, hash_password(password), admin))
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (2,'Alice diary','Alice secret note')")
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (3,'Bob plans','Bob secret note')")
     db.commit()
@@ -71,7 +59,6 @@ def init_db():
 init_db()
 
 
-# --- request models --------------------------------------------------------
 class Credentials(BaseModel):
     username: str
     password: str
@@ -82,83 +69,90 @@ class NewNote(BaseModel):
     body: str
 
 
-# --- auth helper -----------------------------------------------------------
-def current_user(authorization: str = Header(default=None)):
-    """Read the token from the Authorization header and return the user row."""
-    token = (authorization or "").replace("Bearer ", "")
-    row = db.execute("SELECT * FROM users WHERE id = ?", (token,)).fetchone()
-    return row
+def make_token(user_id: int) -> str:
+    payload = f"{user_id}:{int(time.time()) + TOKEN_LIFETIME}:{secrets.token_hex(16)}"
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(SECRET_KEY.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
 
 
-# --- error handling --------------------------------------------------------
+def current_user(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    token = authorization[7:]
+    try:
+        payload, signature = token.split(".")
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("Invalid token signature")
+        decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
+        uid, expires, nonce = decoded.split(":")
+        if not nonce or int(expires) <= time.time():
+            raise ValueError("Expired token")
+        row = db.execute("SELECT id, username, is_admin FROM users WHERE id = ?", (int(uid),)).fetchone()
+        if row is None:
+            raise ValueError("Unknown user")
+        return row
+    except (ValueError, TypeError, UnicodeError, base64.binascii.Error):
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from None
+
+
 @app.exception_handler(Exception)
 async def handle_everything(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"error": str(exc), "trace": traceback.format_exc()},
-    )
+    logging.exception("Unhandled request error")
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
-# --- routes ----------------------------------------------------------------
 @app.post("/register")
 def register(creds: Credentials):
-    db.execute(
-        "INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)",
-        (creds.username, creds.password),
-    )
-    db.commit()
+    if not creds.username.strip() or not creds.password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    try:
+        db.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)",
+                   (creds.username, hash_password(creds.password)))
+        db.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Username unavailable") from None
     return {"message": f"user {creds.username} created"}
 
 
 @app.post("/login")
 def login(creds: Credentials):
-    row = db.execute(
-        f"SELECT id, password FROM users WHERE username = '{creds.username}'"
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="No account with that username")
-    if row["password"] != creds.password:
-        raise HTTPException(status_code=401, detail="Wrong password")
-    return {"token": str(row["id"])}
+    row = db.execute("SELECT id, password FROM users WHERE username = ?", (creds.username,)).fetchone()
+    if row is None or not verify_password(creds.password, row["password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"token": make_token(row["id"])}
 
 
 @app.get("/notes")
-def list_my_notes(authorization: str = Header(default=None)):
+def list_my_notes(authorization: str | None = Header(default=None)):
     user = current_user(authorization)
-    rows = db.execute("SELECT * FROM notes WHERE owner_id = ?", (user["id"],)).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in db.execute("SELECT * FROM notes WHERE owner_id = ?", (user["id"],)).fetchall()]
 
 
 @app.get("/notes/{note_id}")
-def get_note(note_id: int, authorization: str = Header(default=None)):
+def get_note(note_id: int, authorization: str | None = Header(default=None)):
     user = current_user(authorization)
-    row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+    row = db.execute("SELECT * FROM notes WHERE id = ? AND owner_id = ?", (note_id, user["id"])).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Note not found")
     return dict(row)
 
 
 @app.post("/notes")
-def create_note(note: NewNote, authorization: str = Header(default=None)):
+def create_note(note: NewNote, authorization: str | None = Header(default=None)):
     user = current_user(authorization)
-    cur = db.execute(
-        "INSERT INTO notes (owner_id, title, body) VALUES (?, ?, ?)",
-        (user["id"], note.title, note.body),
-    )
+    cur = db.execute("INSERT INTO notes (owner_id, title, body) VALUES (?, ?, ?)", (user["id"], note.title, note.body))
     db.commit()
     return {"id": cur.lastrowid, "title": note.title}
 
 
 @app.get("/admin/users")
-def list_all_users(authorization: str = Header(default=None)):
+def list_all_users(authorization: str | None = Header(default=None)):
     user = current_user(authorization)
-    try:
-        if not user["is_admin"]:
-            raise HTTPException(status_code=403, detail="Admins only")
-    except Exception:
-        pass  # keep going if the check has a problem
-    rows = db.execute("SELECT * FROM users").fetchall()
-    return [dict(r) for r in rows]
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+    return [dict(r) for r in db.execute("SELECT id, username, is_admin FROM users").fetchall()]
 
 
 @app.get("/")
